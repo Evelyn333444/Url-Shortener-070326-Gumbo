@@ -5,10 +5,9 @@
   "license": "ISC",
   "author": "",
   "type": "commonjs",
-  "main": "server.js",
+  "main": "index.js",
   "scripts": {
-    "devStart": "nodemon server.js",
-    "start": "node server.js"
+    "devStart": "nodemon server.js"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
