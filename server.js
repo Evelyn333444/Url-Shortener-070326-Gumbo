@@ -11,6 +11,13 @@ mongoose.set("bufferCommands", false);
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+let lastDbError = "Connecting to MongoDB Atlas...";
+let cached = global.mongoose;
+
+if (!cached) {
+  cached = global.mongoose = { conn: null, promise: null };
+}
+
 function getConnectionUris() {
   const uris = [];
 
@@ -49,36 +56,106 @@ function getConnectionUris() {
   return [...new Set(uris)];
 }
 
-let lastDbError = "Connecting to MongoDB Atlas...";
+async function connectDatabase() {
+  if (mongoose.connection.readyState === 1) {
+    return mongoose.connection;
+  }
+
+  if (cached.conn) {
+    return cached.conn;
+  }
+
+  if (!cached.promise) {
+    cached.promise = (async () => {
+      const uris = getConnectionUris();
+      const errors = [];
+      lastDbError = "Connecting to MongoDB Atlas...";
+
+      if (!process.env.MONGODB_URI && !process.env.MONGODB_URI_STANDARD) {
+        throw new Error(
+          "MONGODB_URI is not set. Add it in Vercel → Settings → Environment Variables."
+        );
+      }
+
+      for (const uri of uris) {
+        try {
+          if (mongoose.connection.readyState !== 0) {
+            await mongoose.disconnect();
+          }
+
+          console.log("Trying MongoDB connection...");
+          const conn = await mongoose.connect(uri, {
+            serverSelectionTimeoutMS: 15000,
+            family: 4,
+          });
+          lastDbError = "";
+          console.log("MongoDB connected");
+          return conn;
+        } catch (err) {
+          errors.push(err.message);
+          lastDbError = err.message;
+          console.error("MongoDB connection error:", err.message);
+        }
+      }
+
+      lastDbError =
+        errors.find((message) =>
+          /whitelist|IP that isn't|bad auth|Authentication failed|MONGODB_URI is not set/i.test(
+            message
+          )
+        ) ||
+        errors.find((message) => !/querySrv|ENOTFOUND/i.test(message)) ||
+        errors[errors.length - 1] ||
+        "Unknown connection error";
+
+      throw new Error(lastDbError);
+    })();
+  }
+
+  try {
+    cached.conn = await cached.promise;
+    return cached.conn;
+  } catch (err) {
+    cached.promise = null;
+    throw err;
+  }
+}
 
 app.set("view engine", "ejs");
 app.use(express.urlencoded({ extended: false }));
 
-function dbReady(_req, res, next) {
-  if (mongoose.connection.readyState !== 1) {
-    let hint = "";
+function dbHint() {
+  if (/MONGODB_URI is not set/i.test(lastDbError)) {
+    return `<p><strong>Vercel fix:</strong> Go to your project on Vercel → <strong>Settings</strong> → <strong>Environment Variables</strong> → add <code>MONGODB_URI</code> with your Atlas connection string → redeploy.</p>`;
+  }
 
-    if (/Connecting to MongoDB/i.test(lastDbError)) {
-      hint = `<p>Still connecting — wait about 20 seconds and refresh. If this stays, check the terminal for errors.</p>`;
-    } else if (/ENOTFOUND|querySrv/.test(lastDbError)) {
-      hint = `<p><strong>Most likely fix:</strong> The cluster name in <code>.env</code> is wrong or the cluster was deleted. In Atlas, open <strong>Database</strong> → your cluster → <strong>Connect</strong> → <strong>Drivers</strong>, copy the full connection string, and replace <code>MONGODB_URI</code>. The part after <code>@</code> must be your real cluster, like <code>mycluster.abc123.mongodb.net</code> — not <code>cluster.mongodb.net</code> or an old deleted name.</p>`;
-    } else if (/whitelist|IP that isn't|Authentication failed|bad auth/i.test(lastDbError)) {
-      hint = `<p><strong>Check these in Atlas (same project as UrlShortener07032026):</strong></p>
-      <ol>
-        <li><strong>Network Access</strong> (not the cluster page) → entry <code>0.0.0.0/0</code> must say <strong>Active</strong></li>
-        <li><strong>Database Access</strong> → user <code>brackesb12_db_user</code> exists and password matches <code>.env</code></li>
-        <li><strong>Database</strong> → cluster is running (green), not paused</li>
-      </ol>`;
-    }
+  if (/Connecting to MongoDB/i.test(lastDbError)) {
+    return `<p>Still connecting — wait a moment and refresh.</p>`;
+  }
 
+  if (/ENOTFOUND|querySrv/.test(lastDbError)) {
+    return `<p><strong>Fix:</strong> Copy a fresh connection string from Atlas → Connect → Drivers and update <code>MONGODB_URI</code>.</p>`;
+  }
+
+  if (/whitelist|IP that isn't|Authentication failed|bad auth/i.test(lastDbError)) {
+    return `<p><strong>Fix in Atlas:</strong> Network Access → <code>0.0.0.0/0</code> Active. Database Access → correct username/password in <code>MONGODB_URI</code>.</p>`;
+  }
+
+  return "";
+}
+
+async function dbReady(_req, res, next) {
+  try {
+    await connectDatabase();
+    next();
+  } catch (err) {
+    lastDbError = err.message;
     return res.status(503).send(`
       <h1>Database not connected</h1>
       <p><strong>Error:</strong> ${lastDbError}</p>
-      ${hint}
-      <p>Restart nodemon after updating <code>.env</code>, then refresh.</p>
+      ${dbHint()}
     `);
   }
-  next();
 }
 
 app.get("/", dbReady, async (req, res) => {
@@ -103,60 +180,24 @@ app.get("/:short", dbReady, async (req, res) => {
   res.redirect(shortUrl.full);
 });
 
-async function connectDatabase() {
-  const uris = getConnectionUris();
-  const errors = [];
+module.exports = app;
 
-  lastDbError = "Connecting to MongoDB Atlas...";
+if (require.main === module) {
+  const server = app.listen(PORT, () => {
+    console.log(`Open http://localhost:${PORT} in your browser`);
+    connectDatabase().catch((err) => {
+      console.error(err.message);
+    });
+  });
 
-  for (const uri of uris) {
-    try {
-      if (mongoose.connection.readyState !== 0) {
-        await mongoose.disconnect();
-      }
-
-      console.log("Trying MongoDB connection...");
-
-      await mongoose.connect(uri, {
-        serverSelectionTimeoutMS: 15000,
-        family: 4,
-      });
-      lastDbError = "";
-      console.log("MongoDB connected");
-      return;
-    } catch (err) {
-      errors.push(err.message);
-      lastDbError = err.message;
-      console.error("MongoDB connection error:", err.message);
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(
+        `Port ${PORT} is in use. Stop the other process or run: PORT=3002 npm run devStart`
+      );
+    } else {
+      console.error(err);
     }
-  }
-
-  lastDbError =
-    errors.find((message) => /whitelist|IP that isn't|bad auth|Authentication failed/i.test(message)) ||
-    errors.find((message) => !/querySrv|ENOTFOUND/i.test(message)) ||
-    errors[errors.length - 1] ||
-    "Unknown connection error";
-
-  console.error("Retrying MongoDB connection in 5 seconds...");
-  const host = process.env.MONGODB_URI?.match(/@([^/?]+)/)?.[1];
-  if (host) {
-    console.error(`Trying host: ${host}`);
-  }
-  setTimeout(connectDatabase, 5000);
+    process.exit(1);
+  });
 }
-
-const server = app.listen(PORT, () => {
-  console.log(`Open http://localhost:${PORT} in your browser`);
-  connectDatabase();
-});
-
-server.on("error", (err) => {
-  if (err.code === "EADDRINUSE") {
-    console.error(
-      `Port ${PORT} is in use. Stop the other process or run: PORT=3002 npm run devStart`
-    );
-  } else {
-    console.error(err);
-  }
-  process.exit(1);
-});
